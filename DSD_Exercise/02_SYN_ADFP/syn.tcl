@@ -4,6 +4,8 @@
 set company {NTUGIEE}
 set designer {Student}
 
+set enable_recovery_removal_arcs true
+
 set search_path    "/share1/tech/ADFP/Executable_Package/Collaterals/IP/stdcell/N16ADFP_StdCell/CCS/ \
                     $search_path .\
                     "
@@ -56,11 +58,12 @@ source -echo -verbose ./GSIM_DC.sdc
 ############################################
 # compile
 ############################################
+set_critical_range 0.2 [current_design]
 uniquify
 set_fix_multiple_port_nets -all -buffer_constants [get_designs *]
-compile_ultra
-# compile -inc
-
+set_fix_hold [all_clocks]
+compile_ultra -retime
+compile_ultra -inc -retime
 
 ############################################
 # output design
@@ -90,7 +93,11 @@ write -format verilog  -hierarchy -output "./${DESIGN}_syn.v"
 write_sdf -version 3.0 -context verilog ./${DESIGN}_syn.sdf
 write_sdc ./${DESIGN}_syn.sdc -version 1.8
 
-report_timing
-report_area
+report_area         -hierarchy
+report_timing       -delay min  -max_path 5
+report_timing       -delay max  -max_path 5
+report_area         -hierarchy              > ./${DESIGN}_syn.area
+report_timing       -delay min  -max_path 5 > ./${DESIGN}_syn.timing_min
+report_timing       -delay max  -max_path 5 > ./${DESIGN}_syn.timing_max
 
 exit

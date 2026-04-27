@@ -1,6 +1,7 @@
 `timescale 1ns/10ps
-`define CYCLE    10.0           	         // Modify your clock period here
+`define CYCLE    0.55           	         // Modify your clock period here
 `define SDFFILE  "../02_SYN/GSIM_syn.sdf"	      // Modify your sdf file name
+`define ADFP_SDFFILE  "../02_SYN_ADFP/GSIM_syn.sdf"	      // Modify your sdf file name
 `define PAT      "../00_TB/pattern3.dat"    
 module test;
 parameter N_PAT   = 16;
@@ -28,9 +29,12 @@ real  SquareError, error, temp;
    
 
 `ifdef SDF
-   initial $sdf_annotate(`SDFFILE, GSIM);
+   `ifdef ADFP
+      initial $sdf_annotate(`ADFP_SDFFILE, GSIM);
+   `else 
+      initial $sdf_annotate(`SDFFILE, GSIM);
+   `endif
 `endif
-
 initial	$readmemh (`PAT, pat_mem);
 
 

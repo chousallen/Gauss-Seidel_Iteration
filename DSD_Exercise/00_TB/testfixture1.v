@@ -1,5 +1,5 @@
 `timescale 1ns/10ps
-`define CYCLE    10.0           	         // Modify your clock period here
+`define CYCLE    0.55           	         // Modify your clock period here
 `define SDFFILE  "../02_SYN/GSIM_syn.sdf"	      // Modify your sdf file name
 `define ADFP_SDFFILE  "../02_SYN_ADFP/GSIM_syn.sdf"	      // Modify your sdf file name
 `define PAT      "../00_TB/pattern1.dat"

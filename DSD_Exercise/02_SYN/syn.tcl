@@ -15,6 +15,9 @@ set default_schematic_options {-size infinite}
 ############################################
 # import design
 ############################################
+sh mkdir -p Netlist
+sh mkdir -p Report
+
 set DESIGN "GSIM"
 
 set hdlin_translate_off_skip_text "TRUE"
@@ -70,12 +73,16 @@ change_names -hierarchy -rules name_rule
 
 remove_unconnected_ports -blast buses [get_cells -hierarchical *]
 set verilogout_higher_designs_first true
-write -format ddc      -hierarchy -output "./${DESIGN}_syn.ddc"
-write -format verilog  -hierarchy -output "./${DESIGN}_syn.v"
-write_sdf -version 3.0 -context verilog ./${DESIGN}_syn.sdf
-write_sdc ./${DESIGN}_syn.sdc -version 1.8
+write -format ddc      -hierarchy -output "./Netlist/${DESIGN}_syn.ddc"
+write -format verilog  -hierarchy -output "./Netlist/${DESIGN}_syn.v"
+write_sdf -version 3.0 -context verilog ./Netlist/${DESIGN}_syn.sdf
+write_sdc ./Netlist/${DESIGN}_syn.sdc -version 1.8
 
-report_timing
-report_area
+report_area         -hierarchy
+report_timing       -delay min  -max_path 5
+report_timing       -delay max  -max_path 5
+report_area         -hierarchy              > ./Report/${DESIGN}_syn.area
+report_timing       -delay min  -max_path 5 > ./Report/${DESIGN}_syn.timing_min
+report_timing       -delay max  -max_path 5 > ./Report/${DESIGN}_syn.timing_max
 
 exit
