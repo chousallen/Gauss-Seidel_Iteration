@@ -37,6 +37,8 @@ import os
 import json
 import math
 import itertools
+import glob
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, List, Tuple
 
 # ---------------------------------------------------------------------------
@@ -49,6 +51,7 @@ ONE_MINUS_OMEGA = -0.25    # 1 - omega
 LEVEL_A_THRESHOLD = 1e-6   # E² < 1e-6  →  Rank A (PASS)
 MAX_ITER_DEFAULT = 10_000  # Safety cap for convergence mode
 CHECKPOINT_DEFAULT = 100_000
+CHUNK_SIZE_DEFAULT = 2048
 
 # Score level boundaries from testfixture1.v (upper-exclusive thresholds)
 SCORE_LEVELS: List[Tuple[float, str, bool]] = [
@@ -352,10 +355,22 @@ def _save_checkpoint(path: str, next_index: int) -> None:
         json.dump({"next_index": next_index}, fh)
 
 
+def _simulate_permutation_case(args: Tuple[Tuple[int, ...], List[int], Optional[int], int]) -> Tuple[str, bool, bool]:
+    """Worker helper for threaded permutation execution."""
+    indices, perm_vals, num_iter, max_iter = args
+    b = [perm_vals[k] for k in indices]
+    result = simulate(b, num_iter, max_iter)
+    level = result["level"]
+    passed = result["passed"]
+    return level, passed, (level == "A")
+
+
 def run_permutation_mode(num_iter:   Optional[int],
                          max_iter:   int,
                          ckpt_path:  str,
-                         progress_n: int) -> None:
+                         progress_n: int,
+                         workers: int,
+                         chunk_size: int) -> None:
     """
     Enumerate ALL 10^16 b-vectors formed by the Cartesian product of
     10 evenly spaced values, simulate each, and report aggregate statistics.
@@ -375,6 +390,8 @@ def run_permutation_mode(num_iter:   Optional[int],
     print(f"  Resuming from index  : {start_idx:,}")
     print(f"  Checkpoint file      : {ckpt_path}")
     print(f"  Progress every       : {progress_n:,} vectors")
+    print(f"  Worker threads       : {workers}")
+    print(f"  Thread chunk size    : {chunk_size:,}")
     print("!" * 68)
     print()
 
@@ -384,29 +401,51 @@ def run_permutation_mode(num_iter:   Optional[int],
     rank_a_count = 0
 
     # Lazy Cartesian product, skipped to start_idx using islice
-    gen = itertools.islice(
-        itertools.product(range(10), repeat=N),
-        start_idx,
-        None
-    )
+    gen = itertools.islice(itertools.product(range(10), repeat=N), start_idx, None)
 
-    for rel_idx, indices in enumerate(gen):
-        abs_idx = start_idx + rel_idx
-        b       = [perm_vals[k] for k in indices]
-        result  = simulate(b, num_iter, max_iter)
+    processed = 0
+    if workers <= 1:
+        for indices in gen:
+            level, passed, is_rank_a = _simulate_permutation_case(
+                (indices, perm_vals, num_iter, max_iter)
+            )
+            level_counts[level] += 1
+            if passed:
+                pass_count += 1
+            if is_rank_a:
+                rank_a_count += 1
 
-        level = result["level"]
-        level_counts[level] += 1
-        if result["passed"]:
-            pass_count += 1
-        if level == "A":
-            rank_a_count += 1
+            processed += 1
+            abs_idx = start_idx + processed
+            if processed % progress_n == 0:
+                _save_checkpoint(ckpt_path, abs_idx)
+                pct = abs_idx / total * 100
+                print(f"  [{abs_idx:>20,} / {total:,}] ({pct:.6f}%)"
+                      f"  PASS: {pass_count:,}  Rank A: {rank_a_count:,}")
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            while True:
+                chunk = list(itertools.islice(gen, chunk_size))
+                if not chunk:
+                    break
 
-        if (rel_idx + 1) % progress_n == 0:
-            _save_checkpoint(ckpt_path, abs_idx + 1)
-            pct = (abs_idx + 1) / total * 100
-            print(f"  [{abs_idx + 1:>20,} / {total:,}] ({pct:.6f}%)"
-                  f"  PASS: {pass_count:,}  Rank A: {rank_a_count:,}")
+                work_items = (
+                    (indices, perm_vals, num_iter, max_iter) for indices in chunk
+                )
+                for level, passed, is_rank_a in executor.map(_simulate_permutation_case, work_items):
+                    level_counts[level] += 1
+                    if passed:
+                        pass_count += 1
+                    if is_rank_a:
+                        rank_a_count += 1
+
+                    processed += 1
+                    abs_idx = start_idx + processed
+                    if processed % progress_n == 0:
+                        _save_checkpoint(ckpt_path, abs_idx)
+                        pct = abs_idx / total * 100
+                        print(f"  [{abs_idx:>20,} / {total:,}] ({pct:.6f}%)"
+                              f"  PASS: {pass_count:,}  Rank A: {rank_a_count:,}")
 
     # Final summary
     print()
@@ -446,9 +485,9 @@ def build_parser() -> argparse.ArgumentParser:
         "input",
         nargs="?",
         default=None,
-        metavar="PATTERN_FILE",
+        metavar="PATTERN_FILE_OR_DIR",
         help=(
-            "Path to a .dat file with 16 hex b-values (one per line). "
+            "Path to a .dat file or a directory containing .dat files. "
             "Omit to enumerate all 10^16 permutations of 10 evenly-spaced values."
         ),
     )
@@ -501,34 +540,102 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help=f"Print progress every N vectors in permutation mode [default: {CHECKPOINT_DEFAULT}].",
     )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Worker thread count for independent test cases [default: 1].",
+    )
+    p.add_argument(
+        "--chunk-size",
+        type=int,
+        default=CHUNK_SIZE_DEFAULT,
+        metavar="N",
+        help=f"Thread work chunk size for permutation mode [default: {CHUNK_SIZE_DEFAULT}].",
+    )
     return p
+
+
+def _collect_pattern_files(path: str) -> List[str]:
+    """Return sorted pattern file list from a file path or directory path."""
+    if os.path.isfile(path):
+        return [path]
+    if os.path.isdir(path):
+        files = sorted(glob.glob(os.path.join(path, "pattern*.dat")))
+        if not files:
+            files = sorted(glob.glob(os.path.join(path, "*.dat")))
+        return files
+    return []
+
+
+def _simulate_pattern_path(args: Tuple[str, Optional[int], int]) -> Tuple[str, dict]:
+    """Worker helper for threaded pattern-file execution."""
+    path, iters, max_iter = args
+    b = parse_pattern_file(path)
+    return path, simulate(b, iters, max_iter)
 
 
 def main() -> None:
     parser = build_parser()
     args   = parser.parse_args()
 
+    if args.workers < 1:
+        print("Error: --workers must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.chunk_size < 1:
+        print("Error: --chunk-size must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.progress < 1:
+        print("Error: --progress must be >= 1", file=sys.stderr)
+        sys.exit(1)
+
     # --iterations flag overrides positional argument
     iters = args.iterations_flag if args.iterations_flag is not None else args.iterations
 
     if args.input is not None:
         # ── File mode ──────────────────────────────────────────────────────
-        if not os.path.isfile(args.input):
-            print(f"Error: file not found: {args.input}", file=sys.stderr)
+        pattern_files = _collect_pattern_files(args.input)
+        if not pattern_files:
+            print(f"Error: no pattern file(s) found at: {args.input}", file=sys.stderr)
             sys.exit(1)
 
-        b      = parse_pattern_file(args.input)
-        result = simulate(b, iters, args.max_iter)
+        if len(pattern_files) == 1:
+            path = pattern_files[0]
+            b = parse_pattern_file(path)
+            result = simulate(b, iters, args.max_iter)
 
-        if args.quiet:
-            print_result(result, quiet=True)
-        else:
-            print(f"\n  Pattern file : {args.input}")
-            if iters is not None:
-                print(f"  Mode         : fixed {iters} iteration(s)")
+            if args.quiet:
+                print_result(result, quiet=True)
             else:
-                print(f"  Mode         : convergence (cap={args.max_iter})")
-            print_result(result, quiet=False, show_golden=args.golden)
+                print(f"\n  Pattern file : {path}")
+                if iters is not None:
+                    print(f"  Mode         : fixed {iters} iteration(s)")
+                else:
+                    print(f"  Mode         : convergence (cap={args.max_iter})")
+                print_result(result, quiet=False, show_golden=args.golden)
+        else:
+            print(f"\n  Multi-pattern mode: {len(pattern_files)} test cases")
+            print(f"  Worker threads    : {args.workers}")
+
+            jobs = ((path, iters, args.max_iter) for path in pattern_files)
+            if args.workers <= 1:
+                results = [_simulate_pattern_path(job) for job in jobs]
+            else:
+                with ThreadPoolExecutor(max_workers=args.workers) as executor:
+                    results = list(executor.map(_simulate_pattern_path, jobs))
+
+            for path, result in results:
+                if args.quiet:
+                    print(f"{os.path.basename(path)}:", end=" ")
+                    print_result(result, quiet=True)
+                else:
+                    print(f"\n  Pattern file : {path}")
+                    if iters is not None:
+                        print(f"  Mode         : fixed {iters} iteration(s)")
+                    else:
+                        print(f"  Mode         : convergence (cap={args.max_iter})")
+                    print_result(result, quiet=False, show_golden=False)
 
     else:
         # ── Permutation mode ───────────────────────────────────────────────
@@ -538,7 +645,14 @@ def main() -> None:
                 f"E² < 1e-6 or {args.max_iter} iterations.",
                 file=sys.stderr,
             )
-        run_permutation_mode(iters, args.max_iter, args.checkpoint, args.progress)
+        run_permutation_mode(
+            iters,
+            args.max_iter,
+            args.checkpoint,
+            args.progress,
+            args.workers,
+            args.chunk_size,
+        )
 
 
 if __name__ == "__main__":
